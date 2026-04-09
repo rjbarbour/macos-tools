@@ -58,12 +58,13 @@ if [ -z "$PROJECT_NAME" ]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEST_BASE="$HOME/DocsLocal"
 SESSIONS_DIR="$HOME/Library/Application Support/Claude/claude-code-sessions"
 COWORK_DIR="$HOME/Library/Application Support/Claude/local-agent-mode-sessions"
 CLI_PROJECTS="$HOME/.claude/projects"
 CODEX_SESSIONS="$HOME/.codex/sessions"
-OUT="$DEST_BASE/orbstack-search/migrate-${PROJECT_NAME//[^a-zA-Z0-9_-]/_}.log"
+OUT="$SCRIPT_DIR/migrate-${PROJECT_NAME//[^a-zA-Z0-9_-]/_}.log"
 
 log() { echo "$1" | tee -a "$OUT"; }
 die() { log "  ABORT: $1"; exit 1; }
@@ -89,7 +90,7 @@ if [ "$DRY_RUN" = true ]; then
 fi
 log ""
 
-# ── 1. Pre-flight ────────────────────────────────────────
+# ── Pre-flight ──────────────────────────────────────────
 log "[1/8] Pre-flight checks"
 
 # Claude Desktop must not be running (current user only)
@@ -149,12 +150,15 @@ fi
 log "  ✓ Disk space OK"
 log ""
 
-# ── 2. Detect tool references ───────────────────────────
+# ── Detect tool references ──────────────────────────────
 log "[2/8] Scanning for AI tool references to this project"
 
 # Claude Code path encoding: / → - and _ → -
 encode_path() {
-    echo "$1" | sed 's|^/|-|' | sed 's|/|-|g' | sed 's|_|-|g'
+    local p="${1/#\//-}"
+    p="${p//\//-}"
+    p="${p//_/-}"
+    echo "$p"
 }
 
 HAS_DESKTOP=false
@@ -229,11 +233,13 @@ fi
 
 log ""
 
-# ── 3. Confirmation ─────────────────────────────────────
+# Compute source stats once (used by dry-run, confirmation, and copy)
+SRC_COUNT=$(find "$SRC" -type f | wc -l | tr -d ' ')
+SRC_SIZE=$(du -sh "$SRC" | cut -f1)
+
+# ── Confirmation / dry-run ──────────────────────────────
 if [ "$DRY_RUN" = true ]; then
     log "[DRY RUN] Would copy:"
-    SRC_SIZE=$(du -sh "$SRC" | cut -f1)
-    SRC_COUNT=$(find "$SRC" -type f | wc -l | tr -d ' ')
     log "  $SRC ($SRC_SIZE, $SRC_COUNT files)"
     log "  → $DEST"
     [ "$HAS_DESKTOP" = true ] && log "  Would update ${#MATCHING_SESSIONS[@]} Desktop session(s)"
@@ -246,7 +252,6 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 if [ "$FORCE" = false ]; then
-    SRC_SIZE=$(du -sh "$SRC" | cut -f1)
     echo ""
     echo "  Will copy: $SRC ($SRC_SIZE)"
     echo "        To:  $DEST"
@@ -262,10 +267,8 @@ if [ "$FORCE" = false ]; then
     fi
 fi
 
-# ── 4. Copy ──────────────────────────────────────────────
+# ── Copy ────────────────────────────────────────────────
 mkdir -p "$DEST"
-SRC_COUNT=$(find "$SRC" -type f | wc -l | tr -d ' ')
-SRC_SIZE=$(du -sh "$SRC" | cut -f1)
 log "[3/8] Copying $PROJECT_NAME ($SRC_SIZE, $SRC_COUNT files)"
 log "  Copying..."
 
@@ -284,27 +287,143 @@ fi
 log "  ✓ Copied and verified ($DEST_SIZE, $DEST_COUNT files)"
 log ""
 
-# ── 5. Update session metadata ──────────────────────────
+# ── Shared Python helper for session metadata updates ───
+# Defines rewrite() once; modes: check_cwd, desktop, cowork, codex
+UPDATE_SESSION_PY=$(cat << 'PYEOF'
+import json, sys
+
+def rewrite(path, old_base, new_base):
+    """Replace old_base prefix with new_base if path matches."""
+    if path == old_base:
+        return new_base
+    elif path.startswith(old_base + '/'):
+        return new_base + path[len(old_base):]
+    return None
+
+mode = sys.argv[1]
+filepath = sys.argv[2]
+old_base = sys.argv[3]
+new_base = sys.argv[4]
+
+if mode == 'check_cwd':
+    # Read cwd from JSON; print it or empty string on error
+    try:
+        with open(filepath) as f:
+            print(json.load(f).get('cwd', ''))
+    except Exception:
+        print('')
+
+elif mode == 'desktop':
+    with open(filepath) as f:
+        data = json.load(f)
+    new_path = rewrite(data.get('cwd', ''), old_base, new_base)
+    if new_path is None:
+        print(f'    - Skipping (cwd not under {old_base})')
+        sys.exit(0)
+    data['cwd'] = new_path
+    data['originCwd'] = new_path
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=2)
+    with open(filepath) as f:
+        v = json.load(f)
+    assert v['cwd'] == new_path, f"cwd verify failed: {v['cwd']}"
+    assert v['originCwd'] == new_path, f"originCwd verify failed: {v['originCwd']}"
+    print('    ✓ Verified')
+
+elif mode == 'cowork':
+    with open(filepath) as f:
+        data = json.load(f)
+    folders = data.get('userSelectedFolders', [])
+    updated, changes = [], 0
+    for folder in folders:
+        new_folder = rewrite(folder, old_base, new_base)
+        if new_folder is not None:
+            updated.append(new_folder)
+            changes += 1
+            print(f'    {folder}')
+            print(f'    -> {new_folder}')
+        else:
+            updated.append(folder)
+    if changes == 0:
+        print('    - No matching paths in userSelectedFolders')
+        sys.exit(0)
+    data['userSelectedFolders'] = updated
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=2)
+    with open(filepath) as f:
+        assert json.load(f)['userSelectedFolders'] == updated
+    print(f'    ✓ Updated {changes} folder path(s)')
+
+elif mode == 'codex':
+    with open(filepath, 'r', encoding='utf-8', errors='surrogateescape') as f:
+        lines = f.readlines()
+    updated = False
+    new_lines, invalid_count = [], 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            new_lines.append(line); continue
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            invalid_count += 1
+            new_lines.append(line); continue
+        if data.get('type') == 'session_meta' and 'payload' in data and 'cwd' in data['payload']:
+            new_cwd = rewrite(data['payload']['cwd'], old_base, new_base)
+            if new_cwd is not None:
+                print(f'    {data["payload"]["cwd"]}')
+                data['payload']['cwd'] = new_cwd
+                new_lines.append(json.dumps(data) + '\n')
+                updated = True
+                print(f'    -> {new_cwd}')
+            else:
+                print(f'    - Skipping (cwd {data["payload"]["cwd"]} is not under {old_base})')
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+    if invalid_count > 0:
+        print(f'    ⚠ {invalid_count} invalid JSONL line(s) (preserved as-is)')
+    if updated:
+        with open(filepath, 'w', encoding='utf-8', errors='surrogateescape') as f:
+            f.writelines(new_lines)
+        with open(filepath, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            for vline in f:
+                vline = vline.strip()
+                if not vline: continue
+                try: vdata = json.loads(vline)
+                except json.JSONDecodeError: continue
+                if vdata.get('type') == 'session_meta':
+                    vcwd = vdata['payload']['cwd']
+                    assert vcwd == new_base or vcwd.startswith(new_base + '/'), \
+                        f'Codex verify failed: {vcwd} not under {new_base}'
+                    print('    ✓ Verified')
+                    break
+    else:
+        print('    - No session_meta with matching cwd found')
+PYEOF
+)
+
+run_update() {
+    local mode="$1" filepath="$2"
+    echo "$UPDATE_SESSION_PY" | python3 - "$mode" "$filepath" "$SRC" "$DEST"
+}
+
+# ── Update Claude Code Desktop sessions ─────────────────
 log "[4/8] Updating Claude Code Desktop sessions"
 
 if [ ${#MATCHING_SESSIONS[@]} -eq 0 ]; then
     log "  - No sessions to update"
 else
     for sf in "${MATCHING_SESSIONS[@]}"; do
-        OLD_CWD=$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-print(d.get('cwd', ''))
-" "$sf" 2>/dev/null || echo "")
+        OLD_CWD=$(run_update check_cwd "$sf" 2>/dev/null || echo "")
 
         if [ -z "$OLD_CWD" ]; then
             log "  - Skipping (could not read cwd): $sf"
             continue
         fi
 
-        # Verify cwd actually points to our source project (not a different project
-        # that happens to share the same name as a final path component)
+        # Verify cwd points to our source project, not a different project
+        # that happens to share the same name as a final path component
         if [ "$OLD_CWD" != "$SRC" ] && [[ "$OLD_CWD" != "$SRC/"* ]]; then
             log "  - Skipping (cwd $OLD_CWD is not under $SRC): $sf"
             continue
@@ -312,46 +431,10 @@ print(d.get('cwd', ''))
 
         log "  $OLD_CWD → $DEST"
 
-        # Backup
         cp "$sf" "${sf}.bak"
         CURRENT_BACKUP="${sf}.bak"
 
-        # Update cwd and originCwd, preserving subpath if present
-        PYTHON_OUTPUT=$(python3 - "$sf" "$SRC" "$DEST" << 'PYEOF'
-import json, sys
-
-session_file = sys.argv[1]
-old_base = sys.argv[2]
-new_base = sys.argv[3]
-
-with open(session_file) as f:
-    data = json.load(f)
-
-old_cwd = data.get('cwd', '')
-# Rewrite path: replace old_base prefix with new_base
-if old_cwd == old_base:
-    new_path = new_base
-elif old_cwd.startswith(old_base + '/'):
-    new_path = new_base + old_cwd[len(old_base):]
-else:
-    print(f'    - Skipping (cwd {old_cwd} not under {old_base})')
-    sys.exit(0)
-
-data['cwd'] = new_path
-data['originCwd'] = new_path
-
-with open(session_file, 'w') as f:
-    json.dump(data, f, indent=2)
-
-# Verify
-with open(session_file) as f:
-    verify = json.load(f)
-assert verify['cwd'] == new_path, f"cwd verify failed: {verify['cwd']}"
-assert verify['originCwd'] == new_path, f"originCwd verify failed: {verify['originCwd']}"
-
-print('    ✓ Verified')
-PYEOF
-        ) || {
+        PYTHON_OUTPUT=$(run_update desktop "$sf") || {
             log "    ERROR: Update failed — restoring backup"
             cp "${sf}.bak" "$sf"
             CURRENT_BACKUP=""
@@ -363,7 +446,7 @@ PYEOF
 fi
 log ""
 
-# ── 6. Copy CLI history ─────────────────────────────────
+# ── Copy CLI history ────────────────────────────────────
 log "[5/8] CLI project history"
 
 if [ ${#CLI_MATCHES[@]} -eq 0 ]; then
@@ -383,7 +466,7 @@ else
 fi
 log ""
 
-# ── 6b. Update Co-work session metadata ──────────────────
+# ── Update Co-work session metadata ─────────────────────
 log "[6/8] Co-work sessions"
 
 if [ ${#COWORK_SESSIONS[@]} -eq 0 ]; then
@@ -399,51 +482,10 @@ print(d.get('title', 'untitled'))
 
         log "  Updating '$TITLE'"
 
-        # Backup
         cp "$cf" "${cf}.bak"
         CURRENT_BACKUP="${cf}.bak"
 
-        # Update userSelectedFolders: replace entries containing old SRC path with DEST
-        PYTHON_OUTPUT=$(python3 - "$cf" "$SRC" "$DEST" << 'PYEOF'
-import json, sys
-
-session_file = sys.argv[1]
-old_base = sys.argv[2]
-new_base = sys.argv[3]
-
-with open(session_file) as f:
-    data = json.load(f)
-
-folders = data.get('userSelectedFolders', [])
-updated = []
-changes = 0
-for folder in folders:
-    # Path-aware matching: folder must be old_base exactly, or start with old_base/
-    if folder == old_base or folder.startswith(old_base + '/'):
-        new_folder = new_base + folder[len(old_base):]
-        updated.append(new_folder)
-        changes += 1
-        print(f'    {folder}')
-        print(f'    -> {new_folder}')
-    else:
-        updated.append(folder)
-
-data['userSelectedFolders'] = updated
-
-with open(session_file, 'w') as f:
-    json.dump(data, f, indent=2)
-
-# Verify
-with open(session_file) as f:
-    verify = json.load(f)
-assert verify['userSelectedFolders'] == updated
-
-if changes > 0:
-    print(f'    ✓ Updated {changes} folder path(s)')
-else:
-    print('    - No matching paths found in userSelectedFolders')
-PYEOF
-        ) || {
+        PYTHON_OUTPUT=$(run_update cowork "$cf") || {
             log "    ERROR: Update failed — restoring backup"
             cp "${cf}.bak" "$cf"
             CURRENT_BACKUP=""
@@ -455,7 +497,7 @@ PYEOF
 fi
 log ""
 
-# ── 7. Update Codex session_meta cwd ─────────────────────
+# ── Update Codex session_meta cwd ───────────────────────
 log "[7/8] Codex sessions"
 
 if [ ${#CODEX_MATCHES[@]} -eq 0 ]; then
@@ -464,82 +506,10 @@ else
     for cf in "${CODEX_MATCHES[@]}"; do
         log "  Updating: $(basename "$(dirname "$cf")")/$(basename "$cf")"
 
-        # Backup
         cp "$cf" "${cf}.bak"
         CURRENT_BACKUP="${cf}.bak"
 
-        # Rewrite only the session_meta line, preserve all other lines exactly
-        PYTHON_OUTPUT=$(python3 - "$cf" "$SRC" "$DEST" << 'PYEOF'
-import json, sys
-
-jsonl_path = sys.argv[1]
-old_base = sys.argv[2]
-new_base = sys.argv[3]
-
-with open(jsonl_path, "r", encoding="utf-8", errors="surrogateescape") as f:
-    lines = f.readlines()
-
-updated = False
-new_lines = []
-invalid_count = 0
-for line in lines:
-    stripped = line.strip()
-    if not stripped:
-        new_lines.append(line)
-        continue
-    try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
-        invalid_count += 1
-        new_lines.append(line)
-        continue
-
-    if data.get("type") == "session_meta":
-        old_cwd = data.get("payload", {}).get("cwd", "")
-        if "payload" in data and "cwd" in data["payload"]:
-            # Only update if cwd matches the source project path
-            if old_cwd == old_base or old_cwd.startswith(old_base + '/'):
-                new_cwd = new_base + old_cwd[len(old_base):]
-                data["payload"]["cwd"] = new_cwd
-                new_lines.append(json.dumps(data) + "\n")
-                updated = True
-                print(f'    {old_cwd}')
-                print(f'    -> {new_cwd}')
-            else:
-                print(f'    - Skipping (cwd {old_cwd} is not under {old_base})')
-                new_lines.append(line)
-        else:
-            new_lines.append(line)
-    else:
-        new_lines.append(line)
-
-if invalid_count > 0:
-    print(f'    ⚠ {invalid_count} invalid JSONL line(s) found (preserved as-is)')
-
-if updated:
-    with open(jsonl_path, "w", encoding="utf-8", errors="surrogateescape") as f:
-        f.writelines(new_lines)
-
-    # Verify: re-read and check
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for vline in f:
-            vline = vline.strip()
-            if not vline:
-                continue
-            try:
-                vdata = json.loads(vline)
-            except json.JSONDecodeError:
-                continue
-            if vdata.get("type") == "session_meta":
-                vcwd = vdata["payload"]["cwd"]
-                assert vcwd == new_base or vcwd.startswith(new_base + '/'), \
-                    f"Codex verify failed: {vcwd} not under {new_base}"
-                print('    ✓ Verified')
-                break
-else:
-    print('    - No session_meta with cwd found')
-PYEOF
-        ) || {
+        PYTHON_OUTPUT=$(run_update codex "$cf") || {
             log "    ERROR: Update failed — restoring backup"
             cp "${cf}.bak" "$cf"
             CURRENT_BACKUP=""
