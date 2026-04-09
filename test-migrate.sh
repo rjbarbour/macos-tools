@@ -79,6 +79,18 @@ assert_exit_code() {
     fi
 }
 
+assert_file_not_exists() {
+    local label="$1" path="$2"
+    if [ ! -e "$path" ]; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}✓${NC} $label"
+    else
+        FAIL=$((FAIL + 1))
+        ERRORS+=("$label: file unexpectedly found at $path")
+        echo -e "  ${RED}✗${NC} $label"
+    fi
+}
+
 # ── Sandbox setup ────────────────────────────────────────
 # Sets HOME to a sandbox dir. Must NOT be called in a subshell.
 setup_sandbox() {
@@ -182,17 +194,10 @@ assert_contains "Reports Desktop sessions" "Desktop" "$OUTPUT"
 assert_contains "Reports Co-work sessions" "Co-work" "$OUTPUT"
 assert_contains "Reports Codex sessions" "Codex" "$OUTPUT"
 assert_contains "Says dry run" "DRY RUN" "$OUTPUT"
-# Verify nothing was actually copied — dry-run creates the DEST dir for validation then uses it
-# but should not copy files
+# Dry-run should not copy files or create the destination directory
 TEST_FILES=$(find "$HOME/DocsLocal/TestProject" -type f 2>/dev/null | wc -l | tr -d ' ')
 assert_eq "No files copied during dry-run" "0" "$TEST_FILES"
-# Dry-run should not create the destination directory
-if [ -d "$HOME/DocsLocal/TestProject" ]; then
-    DRY_DIR_CREATED="true"
-else
-    DRY_DIR_CREATED="false"
-fi
-assert_eq "No dest dir created during dry-run" "false" "$DRY_DIR_CREATED"
+assert_file_not_exists "No dest dir created during dry-run" "$HOME/DocsLocal/TestProject"
 restore_home
 
 # ── Test 3: Full migration with all four tools ───────────
