@@ -1,6 +1,14 @@
-# macos-tools — Project Migration Toolkit
+# macos-tools
 
-## Purpose
+A collection of small, self-contained macOS utilities. Each utility lives in its own subdirectory.
+
+## Repository Layout
+
+```
+migrate-project/    — Migrate projects from iCloud to local, updating AI tool sessions
+```
+
+## migrate-project
 
 Safely migrate projects from `~/Documents` (iCloud-managed) to `~/DocsLocal` (local-only), updating AI tool session metadata so sessions continue to load.
 
@@ -44,41 +52,37 @@ Conversation history is server-side only. Not affected by local directory moves.
 
 ## Key Files
 
-- `migrate-project.sh` — Generic migration script. Usage: `bash migrate-project.sh <project-name>`
-- `test-migrate.sh` — Test suite (14 scenarios, 45 assertions). Run: `bash test-migrate.sh`
+All under `migrate-project/`:
+
+- `migrate-project.sh` — Generic migration script. Usage: `bash migrate-project/migrate-project.sh <project-name>`
+- `test-migrate.sh` — Test suite (15 scenarios, 51 assertions). Run: `bash migrate-project/test-migrate.sh`
 - `fix-librechat-session.sh` — Original LibreChat-specific repair script (kept for reference)
 - `check-size.sh`, `find-librechat.sh`, `full-diagnostic.sh`, `inspect-librechat-paths.sh` — Diagnostic scripts from the original LibreChat investigation
-- `.gitignore` — Excludes machine-specific outputs (`*.txt` logs, `*.bak` backups, `migrate-*.log`)
 
 ## Repository
 
-GitHub: `rjbarbour/macos-tools` (or wherever pushed). Local working directory is `~/DocsLocal/orbstack-search/`.
-
-To create the repo and push:
-```bash
-cd ~/DocsLocal/orbstack-search
-gh repo create macos-tools --public --source=. --remote=origin --push
-```
+GitHub: `rjbarbour/macos-tools`. Local working directory is `~/DocsLocal/orbstack-search/`.
 
 ## Test Suite
 
-`test-migrate.sh` creates isolated sandboxes under `/tmp`, simulates all four AI tool session stores, and validates the full migration pipeline. 14 test scenarios covering:
+`migrate-project/test-migrate.sh` creates isolated sandboxes under `/tmp`, simulates all four AI tool session stores, and validates the full migration pipeline. 15 test scenarios, 51 assertions covering:
 
-- Dry-run mode (no side effects)
+- Dry-run mode (no side effects, no directory creation)
 - Full end-to-end migration with all four tools (Desktop, CLI, Co-work, Codex)
 - Project names with spaces ("Obsidian Vault")
 - Non-existent project (clean abort)
 - Malformed session JSON (skip bad, update good)
 - Resumable copy (destination partially exists)
 - Copy-only with no session references
-- grep match but cwd points elsewhere
+- grep match but cwd under different base path (session NOT updated)
 - Codex JSONL without session_meta line
 - Path traversal validation
 - Ambiguous project name (multiple matches)
 - Backup file integrity
 - Co-work subpath replacement (mounts to subdirectories)
+- Unicode U+2019 curly quote in source path
 
-Run: `bash test-migrate.sh` — creates and cleans up its own sandbox, no side effects on the real system.
+Run: `bash migrate-project/test-migrate.sh`
 
 ## Related Projects
 
