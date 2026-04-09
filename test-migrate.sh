@@ -5,8 +5,6 @@
 # Creates a self-contained sandbox under /tmp, simulates all four AI tool
 # session stores, and exercises migrate-project.sh against them.
 # ═══════════════════════════════════════════════════════════════════════
-set -e
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MIGRATE="$SCRIPT_DIR/migrate-project.sh"
 REAL_HOME="$HOME"
@@ -15,6 +13,9 @@ SANDBOX="/tmp/migrate-test-$$"
 PASS=0
 FAIL=0
 ERRORS=()
+
+# Bypass process check — tests run while Claude Desktop may be open
+export SKIP_PROCESS_CHECK=1
 
 # ── Colours ──────────────────────────────────────────────
 RED='\033[0;31m'
@@ -185,6 +186,13 @@ assert_contains "Says dry run" "DRY RUN" "$OUTPUT"
 # but should not copy files
 TEST_FILES=$(find "$HOME/DocsLocal/TestProject" -type f 2>/dev/null | wc -l | tr -d ' ')
 assert_eq "No files copied during dry-run" "0" "$TEST_FILES"
+# Dry-run should not create the destination directory
+if [ -d "$HOME/DocsLocal/TestProject" ]; then
+    DRY_DIR_CREATED="true"
+else
+    DRY_DIR_CREATED="false"
+fi
+assert_eq "No dest dir created during dry-run" "false" "$DRY_DIR_CREATED"
 restore_home
 
 # ── Test 3: Full migration with all four tools ───────────
@@ -355,18 +363,19 @@ assert_contains "Warns no references" "No Claude Code" "$OUTPUT"
 
 restore_home
 
-# ── Test 9: Desktop session cwd points elsewhere ────────
+# ── Test 9: Desktop session grep matches but cwd has different base ──
 echo ""
-echo "Test 9: grep match but cwd points elsewhere — still runs"
+echo "Test 9: grep match but cwd under different base — session NOT updated"
 setup_sandbox "t9"
 PROJECT_SRC=$(create_project "$HOME/Documents" "Overlap")
 
-# Session mentions "Overlap" in cwd but different path structure
+# Session cwd ends with /Overlap" (grep will match) but has a different base path.
+# The script must NOT rewrite this session.
 cat > "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json" << ENDJSON
 {
   "sessionId": "local_test123",
-  "cwd": "/some/other/Overlap/path",
-  "originCwd": "/some/other/Overlap/path",
+  "cwd": "/Users/other_user/projects/Overlap",
+  "originCwd": "/Users/other_user/projects/Overlap",
   "title": "Overlap Test"
 }
 ENDJSON
@@ -375,6 +384,14 @@ OUTPUT=$(bash "$MIGRATE" --force Overlap 2>&1)
 EXIT_CODE=$?
 assert_exit_code "Exits 0" "0" "$EXIT_CODE"
 assert_file_exists "Files copied" "$HOME/DocsLocal/Overlap/README.md"
+
+# Verify the session was NOT modified — cwd should still point to the other user's path
+OVERLAP_CWD=$(python3 -c "
+import json
+with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
+    print(json.load(f)['cwd'])
+")
+assert_eq "Session with different base NOT modified" "/Users/other_user/projects/Overlap" "$OVERLAP_CWD"
 
 restore_home
 
@@ -479,6 +496,44 @@ FOLDER3=$(echo "$COWORK_FOLDERS" | sed -n '3p')
 assert_eq "Subpath rewritten" "$HOME/DocsLocal/SubPath/deep/nested/dir" "$FOLDER1"
 assert_eq "Exact path rewritten" "$HOME/DocsLocal/SubPath" "$FOLDER2"
 assert_eq "Unrelated path preserved" "/other/path" "$FOLDER3"
+
+restore_home
+
+# ── Test 15: Unicode U+2019 curly quote in source path ───
+echo ""
+echo "Test 15: Project under path with Unicode curly quote (U+2019)"
+setup_sandbox "t15"
+# Simulate the macOS Migration Assistant directory name with U+2019 curly apostrophe
+UNICODE_DIR="$HOME/Documents/Documents - TMD"$'\xe2\x80\x99'"s MacBook Pro"
+mkdir -p "$UNICODE_DIR"
+PROJECT_SRC=$(create_project "$UNICODE_DIR" "UnicodeProj")
+create_desktop_session "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1" "$PROJECT_SRC"
+create_codex_session "$HOME/.codex/sessions/sess1" "$PROJECT_SRC"
+
+OUTPUT=$(bash "$MIGRATE" --force UnicodeProj 2>&1)
+EXIT_CODE=$?
+assert_exit_code "Exits 0 with Unicode path" "0" "$EXIT_CODE"
+assert_file_exists "Project copied from Unicode path" "$HOME/DocsLocal/UnicodeProj/README.md"
+
+# Verify Desktop session updated
+UNICODE_CWD=$(python3 -c "
+import json
+with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
+    print(json.load(f)['cwd'])
+")
+assert_eq "Desktop cwd updated from Unicode source" "$HOME/DocsLocal/UnicodeProj" "$UNICODE_CWD"
+
+# Verify Codex session updated
+UNICODE_CODEX=$(python3 -c "
+import json
+with open('$HOME/.codex/sessions/sess1/session.jsonl') as f:
+    for line in f:
+        d = json.loads(line.strip())
+        if d.get('type') == 'session_meta':
+            print(d['payload']['cwd'])
+            break
+")
+assert_eq "Codex cwd updated from Unicode source" "$HOME/DocsLocal/UnicodeProj" "$UNICODE_CODEX"
 
 restore_home
 
