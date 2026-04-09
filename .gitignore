@@ -1,0 +1,12 @@
+# Output logs from migration runs
+migrate-*.log
+
+# Diagnostic outputs (machine-specific)
+*.txt
+!README.md
+
+# macOS
+.DS_Store
+
+# Backup files created by the migration script
+*.bak
