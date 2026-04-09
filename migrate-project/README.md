@@ -9,7 +9,10 @@ macOS Migration Assistant creates nested directories under `~/Documents` (e.g. `
 ## Quick Start
 
 ```bash
-# Quit Claude Desktop first (Cmd+Q), then:
+# From the repo root — quit Claude Desktop first (Cmd+Q):
+bash migrate-project/migrate-project.sh <project-name>
+
+# Or from inside the migrate-project/ directory:
 bash migrate-project.sh <project-name>
 
 # Options:
@@ -69,7 +72,6 @@ bash test-migrate.sh
 | `migrate-project.sh` | Generic migration script |
 | `test-migrate.sh` | Test suite (15 scenarios, 51 assertions) |
 | `fix-librechat-session.sh` | Original LibreChat-specific script (reference) |
-| `CLAUDE.md` | Technical context for AI coding tools |
 | Diagnostic scripts | `check-size.sh`, `find-librechat.sh`, `full-diagnostic.sh`, `inspect-librechat-paths.sh` |
 
 ## Requirements
