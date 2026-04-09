@@ -3,12 +3,23 @@
 # migrate-project.sh — Safely migrate a project from ~/Documents (iCloud)
 #                       to ~/DocsLocal, updating AI tool session metadata.
 #
-# BACKGROUND
+# THREE-PATH MODEL
 # macOS Migration Assistant creates a nested subdirectory under ~/Documents
 # named "Documents - <OldMacName>" (with a Unicode curly-quote U+2019 in
-# the possessive). If ~/Documents syncs to iCloud Drive, projects with
-# node_modules, Docker data, and git repos waste bandwidth and break tools
-# that store absolute paths.
+# the possessive). Finder presents a *merged view* of ~/Documents, so tools
+# that open projects see a logical path without the Migration Assistant
+# segment. This script must handle three distinct paths:
+#
+#   Physical path (SRC)     — where files actually live on disk.
+#                             e.g. ~/Documents/Documents - TMD's MBP/Projects/TSC
+#   Session path (SESSION)  — the logical path recorded in AI tool metadata.
+#                             e.g. ~/Documents/Projects/TSC
+#   Destination (DEST)      — where files are being moved to.
+#                             e.g. ~/DocsLocal/TSC
+#
+# The script rsyncs from SRC, but matches and rewrites sessions from
+# SESSION → DEST. If SRC is not under a Migration Assistant subdirectory,
+# SESSION and SRC are the same.
 #
 # TOOL IMPACT
 #   Claude Code Desktop — cwd/originCwd in session JSON. Script updates these.
@@ -120,7 +131,31 @@ elif [ "$SRC_COUNT_FOUND" -gt 1 ]; then
 fi
 SRC="$SRC_CANDIDATES"
 [ -d "$SRC" ] || die "Source is not a directory: $SRC"
-log "  ✓ Source: $SRC"
+log "  ✓ Source (physical): $SRC"
+
+# Compute the logical path that sessions reference.
+# macOS Finder merges "Documents - <MacName>/" into ~/Documents/, so tools
+# opened projects via the shorter path. Strip the Migration Assistant segment.
+SESSION_PATH=$(python3 -c "
+import sys, os
+src = sys.argv[1]
+docs = os.path.expanduser('~/Documents')
+prefix = docs + '/Documents - '
+if src.startswith(prefix):
+    rest = src[len(prefix):]
+    slash = rest.find('/')
+    if slash >= 0:
+        print(docs + '/' + rest[slash + 1:])
+    else:
+        print(src)
+else:
+    print(src)
+" "$SRC")
+
+if [ "$SESSION_PATH" != "$SRC" ]; then
+    log "  ✓ Session path:      $SESSION_PATH"
+    log "    (Finder merged view — sessions use this path, not the physical one)"
+fi
 
 DEST="$DEST_BASE/$PROJECT_NAME"
 
@@ -167,7 +202,7 @@ HAS_CODEX=false
 HAS_COWORK=false
 
 # Claude Code Desktop sessions
-# Search for project name in cwd fields; matches are verified by Python before updating
+# Search for project name in cwd fields; matches are verified before updating
 MATCHING_SESSIONS=()
 if [ -d "$SESSIONS_DIR" ]; then
     while IFS= read -r f; do
@@ -176,22 +211,39 @@ if [ -d "$SESSIONS_DIR" ]; then
 fi
 if [ ${#MATCHING_SESSIONS[@]} -gt 0 ]; then
     HAS_DESKTOP=true
-    log "  Claude Code Desktop: ${#MATCHING_SESSIONS[@]} session(s) — will update cwd"
+    log "  Claude Code Desktop: ${#MATCHING_SESSIONS[@]} session file(s) — will update cwd"
+    # Show session titles for inventory
+    for sf in "${MATCHING_SESSIONS[@]}"; do
+        TITLE=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+print(d.get('title', 'untitled'))
+" "$sf" 2>/dev/null || echo "unknown")
+        log "    • $TITLE"
+    done
 else
     log "  Claude Code Desktop: no sessions reference this project"
 fi
 
-# Claude Code CLI history — match by exact encoded path, not wildcard
+# Claude Code CLI history — match by exact encoded path using SESSION_PATH
+# (CLI history was created when the tool opened the project via the logical path)
+# CLI dir contains parent session(s), subagent JSONLs, and memory
 CLI_MATCHES=()
 if [ -d "$CLI_PROJECTS" ]; then
-    OLD_CLI_ENCODED=$(encode_path "$SRC")
+    OLD_CLI_ENCODED=$(encode_path "$SESSION_PATH")
     if [ -d "$CLI_PROJECTS/$OLD_CLI_ENCODED" ]; then
         CLI_MATCHES=("$CLI_PROJECTS/$OLD_CLI_ENCODED")
     fi
 fi
 if [ ${#CLI_MATCHES[@]} -gt 0 ]; then
     HAS_CLI=true
-    log "  Claude Code CLI:     ${#CLI_MATCHES[@]} history dir(s) — will copy to new path"
+    CLI_DIR="${CLI_MATCHES[0]}"
+    CLI_SESSIONS=$(find "$CLI_DIR" -maxdepth 1 -type d ! -name memory ! -path "$CLI_DIR" 2>/dev/null | wc -l | tr -d ' ')
+    CLI_SUBAGENTS=$(find "$CLI_DIR" -name "*.jsonl" -path "*/subagents/*" 2>/dev/null | wc -l | tr -d ' ')
+    CLI_HAS_MEMORY="no"
+    [ -f "$CLI_DIR/memory/MEMORY.md" ] && CLI_HAS_MEMORY="yes"
+    log "  Claude Code CLI:     will copy history dir to new encoded path"
+    log "    • $CLI_SESSIONS parent session(s), $CLI_SUBAGENTS subagent JSONL(s), memory: $CLI_HAS_MEMORY"
 else
     log "  Claude Code CLI:     no history found"
 fi
@@ -210,16 +262,25 @@ else
     log "  Codex:               no sessions reference this project"
 fi
 
-# Co-work sessions (check userSelectedFolders in session JSON)
+# Co-work sessions (check userSelectedFolders for the session path)
+# Use SESSION_PATH as grep pattern and --include to skip JSONL conversation logs
 COWORK_SESSIONS=()
 if [ -d "$COWORK_DIR" ]; then
     while IFS= read -r f; do
         COWORK_SESSIONS+=("$f")
-    done < <(grep -Frl "$PROJECT_NAME" "$COWORK_DIR" 2>/dev/null || true)
+    done < <(grep -Frl --include='*.json' "$SESSION_PATH" "$COWORK_DIR" 2>/dev/null || true)
 fi
 if [ ${#COWORK_SESSIONS[@]} -gt 0 ]; then
     HAS_COWORK=true
     log "  Co-work:             ${#COWORK_SESSIONS[@]} session(s) — will update userSelectedFolders"
+    for cf in "${COWORK_SESSIONS[@]}"; do
+        TITLE=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+print(d.get('title', 'untitled'))
+" "$cf" 2>/dev/null || echo "unknown")
+        log "    • $TITLE"
+    done
 else
     log "  Co-work:             no sessions reference this project"
 fi
@@ -242,6 +303,9 @@ if [ "$DRY_RUN" = true ]; then
     log "[DRY RUN] Would copy:"
     log "  $SRC ($SRC_SIZE, $SRC_COUNT files)"
     log "  → $DEST"
+    if [ "$SESSION_PATH" != "$SRC" ]; then
+        log "  Session metadata references: $SESSION_PATH"
+    fi
     [ "$HAS_DESKTOP" = true ] && log "  Would update ${#MATCHING_SESSIONS[@]} Desktop session(s)"
     [ "$HAS_CLI" = true ]     && log "  Would copy ${#CLI_MATCHES[@]} CLI history dir(s)"
     [ "$HAS_COWORK" = true ]  && log "  Would update ${#COWORK_SESSIONS[@]} Co-work session(s)"
@@ -405,7 +469,7 @@ PYEOF
 
 run_update() {
     local mode="$1" filepath="$2"
-    echo "$UPDATE_SESSION_PY" | python3 - "$mode" "$filepath" "$SRC" "$DEST"
+    echo "$UPDATE_SESSION_PY" | python3 - "$mode" "$filepath" "$SESSION_PATH" "$DEST"
 }
 
 # ── Update Claude Code Desktop sessions ─────────────────
@@ -422,10 +486,10 @@ else
             continue
         fi
 
-        # Verify cwd points to our source project, not a different project
+        # Verify cwd points to our project's session path, not a different project
         # that happens to share the same name as a final path component
-        if [ "$OLD_CWD" != "$SRC" ] && [[ "$OLD_CWD" != "$SRC/"* ]]; then
-            log "  - Skipping (cwd $OLD_CWD is not under $SRC): $sf"
+        if [ "$OLD_CWD" != "$SESSION_PATH" ] && [[ "$OLD_CWD" != "$SESSION_PATH/"* ]]; then
+            log "  - Skipping (cwd $OLD_CWD is not under $SESSION_PATH): $sf"
             continue
         fi
 

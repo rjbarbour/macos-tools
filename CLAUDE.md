@@ -16,12 +16,24 @@ GitHub: `rjbarbour/macos-tools`. Local working directory is `~/DocsLocal/orbstac
 
 Safely migrate projects from `~/Documents` (iCloud-managed) to `~/DocsLocal` (local-only), updating AI tool session metadata so sessions continue to load. See `migrate-project/README.md` for full usage docs.
 
+### Three-Path Model
+
+This is the core design concept. macOS Finder presents a merged view of `~/Documents/` — files physically at `~/Documents/Documents - TMD's MacBook Pro/Projects/TSC` appear to apps as `~/Documents/Projects/TSC`. AI tools opened projects via the merged view and recorded the logical path. The script handles three distinct paths:
+
+| Path | Example | Used for |
+|------|---------|----------|
+| Physical (`SRC`) | `~/Documents/Documents - TMD's MBP/Projects/TSC` | rsync source, file counts |
+| Session (`SESSION_PATH`) | `~/Documents/Projects/TSC` | Matching and rewriting session metadata |
+| Destination (`DEST`) | `~/DocsLocal/TSC` | rsync target, new session path |
+
+If the project is NOT under a Migration Assistant subdirectory, SESSION_PATH equals SRC.
+
 ### Key Files
 
 All under `migrate-project/`:
 
 - `migrate-project.sh` — Main migration script. Usage: `bash migrate-project/migrate-project.sh <project-name>`
-- `test-migrate.sh` — Test suite (15 scenarios, 51 assertions). Run: `bash migrate-project/test-migrate.sh`
+- `test-migrate.sh` — Test suite (16 scenarios, 61 assertions). Run: `bash migrate-project/test-migrate.sh`
 - `fix-librechat-session.sh` — Original LibreChat-specific repair script (kept for reference)
 - `check-size.sh`, `find-librechat.sh`, `full-diagnostic.sh`, `inspect-librechat-paths.sh` — Diagnostic scripts
 
@@ -30,10 +42,12 @@ All under `migrate-project/`:
 | Tool | Session Location | What's Updated |
 |------|-----------------|----------------|
 | Claude Code Desktop | `~/Library/Application Support/Claude/claude-code-sessions/` | `cwd` and `originCwd` in session JSON |
-| Claude Code CLI | `~/.claude/projects/<encoded-path>/` | History dir copied to new encoded path |
+| Claude Code CLI | `~/.claude/projects/<encoded-path>/` | Entire dir tree copied (parent sessions, subagent JSONLs, memory) |
 | Claude Co-work | `~/Library/Application Support/Claude/local-agent-mode-sessions/` | `userSelectedFolders` array entries |
 | Codex (OpenAI) | `~/.codex/sessions/**/*.jsonl` | `session_meta` line's `cwd` field only |
 | claude.ai | Server-side | Not affected |
+
+**CLI history structure:** A Desktop session spawns subagents whose JSONL files are stored under `~/.claude/projects/<encoded-path>/<session-id>/subagents/`. The CLI dir also holds `memory/MEMORY.md`. The script copies the entire tree with `cp -a`, preserving all subagent sessions and memory.
 
 **Critical warning:** Desktop parent conversation history is stored in volatile Electron app state (LevelDB/memory), NOT in JSONL files. If a session goes stale before migration, the conversation history may be permanently lost.
 

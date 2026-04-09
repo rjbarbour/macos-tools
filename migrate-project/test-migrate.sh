@@ -91,13 +91,47 @@ assert_file_not_exists() {
     fi
 }
 
+# ── JSON/JSONL reading helpers ──────────────────────────
+# Read a field from a JSON file: read_json <file> <dotpath>
+# Supports nested keys and array indices: "cwd", "userSelectedFolders.0"
+read_json() {
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    val = json.load(f)
+for key in sys.argv[2].split('.'):
+    val = val[int(key)] if isinstance(val, list) else val[key]
+print(val)
+" "$1" "$2"
+}
+
+# Read cwd from a Codex JSONL's session_meta line
+read_codex_cwd() {
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    for line in f:
+        d = json.loads(line.strip())
+        if d.get('type') == 'session_meta':
+            print(d['payload']['cwd']); break
+" "$1"
+}
+
+# Claude Code path encoding: / → - and _ → -
+encode_path() {
+    local p="${1/#\//-}"
+    p="${p//\//-}"
+    p="${p//_/-}"
+    echo "$p"
+}
+
 # ── Sandbox setup ────────────────────────────────────────
 # Sets HOME to a sandbox dir. Must NOT be called in a subshell.
 setup_sandbox() {
     local test_name="$1"
     export HOME="$SANDBOX/$test_name/home"
     mkdir -p "$HOME/Documents"
-    mkdir -p "$HOME/DocsLocal/orbstack-search"
+    mkdir -p "$HOME/DocsLocal"
     mkdir -p "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1"
     mkdir -p "$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1"
     mkdir -p "$HOME/.claude/projects"
@@ -189,7 +223,7 @@ create_codex_session "$HOME/.codex/sessions/sess1" "$PROJECT_SRC"
 OUTPUT=$(bash "$MIGRATE" --dry-run TestProject 2>&1)
 EXIT_CODE=$?
 assert_exit_code "Exits 0" "0" "$EXIT_CODE"
-assert_contains "Reports source found" "Source:" "$OUTPUT"
+assert_contains "Reports source found" "Source" "$OUTPUT"
 assert_contains "Reports Desktop sessions" "Desktop" "$OUTPUT"
 assert_contains "Reports Co-work sessions" "Co-work" "$OUTPUT"
 assert_contains "Reports Codex sessions" "Codex" "$OUTPUT"
@@ -208,8 +242,7 @@ PROJECT_SRC=$(create_project "$HOME/Documents" "FullTest")
 create_desktop_session "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1" "$PROJECT_SRC"
 create_cowork_session "$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1" "$PROJECT_SRC"
 create_codex_session "$HOME/.codex/sessions/sess1" "$PROJECT_SRC"
-SRC_ENCODED=$(echo "$PROJECT_SRC" | sed 's|^/|-|' | sed 's|/|-|g' | sed 's|_|-|g')
-create_cli_history "$HOME/.claude/projects" "$SRC_ENCODED"
+create_cli_history "$HOME/.claude/projects" "$(encode_path "$PROJECT_SRC")"
 
 OUTPUT=$(bash "$MIGRATE" --force FullTest 2>&1)
 EXIT_CODE=$?
@@ -221,54 +254,22 @@ assert_file_exists "Source file copied" "$HOME/DocsLocal/FullTest/src/index.js"
 assert_file_exists "README copied" "$HOME/DocsLocal/FullTest/README.md"
 
 # Check Desktop session updated
-DESKTOP_CWD=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
-    print(json.load(f)['cwd'])
-")
-assert_eq "Desktop cwd updated" "$HOME/DocsLocal/FullTest" "$DESKTOP_CWD"
-
-DESKTOP_ORIGIN=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
-    print(json.load(f)['originCwd'])
-")
-assert_eq "Desktop originCwd updated" "$HOME/DocsLocal/FullTest" "$DESKTOP_ORIGIN"
+DESKTOP_JSON="$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json"
+assert_eq "Desktop cwd updated" "$HOME/DocsLocal/FullTest" "$(read_json "$DESKTOP_JSON" cwd)"
+assert_eq "Desktop originCwd updated" "$HOME/DocsLocal/FullTest" "$(read_json "$DESKTOP_JSON" originCwd)"
 
 # Check backup created
 assert_file_exists "Desktop backup created" "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json.bak"
 
 # Check Co-work session updated
-COWORK_FOLDER=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json') as f:
-    d = json.load(f)
-    print(d['userSelectedFolders'][0])
-")
-assert_eq "Co-work folder updated" "$HOME/DocsLocal/FullTest" "$COWORK_FOLDER"
-
-# Check Co-work non-matching folder preserved
-COWORK_OTHER=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json') as f:
-    d = json.load(f)
-    print(d['userSelectedFolders'][1])
-")
-assert_eq "Co-work other folder preserved" "/Users/testuser/Library" "$COWORK_OTHER"
+COWORK_JSON="$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json"
+assert_eq "Co-work folder updated" "$HOME/DocsLocal/FullTest" "$(read_json "$COWORK_JSON" userSelectedFolders.0)"
+assert_eq "Co-work other folder preserved" "/Users/testuser/Library" "$(read_json "$COWORK_JSON" userSelectedFolders.1)"
 
 assert_file_exists "Co-work backup created" "$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json.bak"
 
 # Check Codex session updated
-CODEX_CWD=$(python3 -c "
-import json
-with open('$HOME/.codex/sessions/sess1/session.jsonl') as f:
-    for line in f:
-        d = json.loads(line.strip())
-        if d.get('type') == 'session_meta':
-            print(d['payload']['cwd'])
-            break
-")
-assert_eq "Codex cwd updated" "$HOME/DocsLocal/FullTest" "$CODEX_CWD"
+assert_eq "Codex cwd updated" "$HOME/DocsLocal/FullTest" "$(read_codex_cwd "$HOME/.codex/sessions/sess1/session.jsonl")"
 
 # Check Codex non-meta lines preserved
 CODEX_LINE_COUNT=$(wc -l < "$HOME/.codex/sessions/sess1/session.jsonl" | tr -d ' ')
@@ -277,8 +278,7 @@ assert_eq "Codex JSONL line count preserved" "3" "$CODEX_LINE_COUNT"
 assert_file_exists "Codex backup created" "$HOME/.codex/sessions/sess1/session.jsonl.bak"
 
 # Check CLI history copied
-DEST_ENCODED=$(echo "$HOME/DocsLocal/FullTest" | sed 's|^/|-|' | sed 's|/|-|g' | sed 's|_|-|g')
-assert_file_exists "CLI history copied" "$HOME/.claude/projects/$DEST_ENCODED/.history"
+assert_file_exists "CLI history copied" "$HOME/.claude/projects/$(encode_path "$HOME/DocsLocal/FullTest")/.history"
 
 # Check originals still exist
 assert_file_exists "Source preserved" "$PROJECT_SRC/src/index.js"
@@ -325,12 +325,8 @@ EXIT_CODE=$?
 assert_exit_code "Completes despite bad JSON" "0" "$EXIT_CODE"
 
 # The valid session should still be updated
-DESKTOP_CWD=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
-    print(json.load(f)['cwd'])
-")
-assert_eq "Valid session still updated" "$HOME/DocsLocal/BadJSON" "$DESKTOP_CWD"
+assert_eq "Valid session still updated" "$HOME/DocsLocal/BadJSON" \
+    "$(read_json "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json" cwd)"
 
 restore_home
 
@@ -391,12 +387,8 @@ assert_exit_code "Exits 0" "0" "$EXIT_CODE"
 assert_file_exists "Files copied" "$HOME/DocsLocal/Overlap/README.md"
 
 # Verify the session was NOT modified — cwd should still point to the other user's path
-OVERLAP_CWD=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
-    print(json.load(f)['cwd'])
-")
-assert_eq "Session with different base NOT modified" "/Users/other_user/projects/Overlap" "$OVERLAP_CWD"
+assert_eq "Session with different base NOT modified" "/Users/other_user/projects/Overlap" \
+    "$(read_json "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json" cwd)"
 
 restore_home
 
@@ -488,57 +480,77 @@ OUTPUT=$(bash "$MIGRATE" --force SubPath 2>&1)
 EXIT_CODE=$?
 assert_exit_code "Exits 0" "0" "$EXIT_CODE"
 
-COWORK_FOLDERS=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json') as f:
-    d = json.load(f)
-    for folder in d['userSelectedFolders']:
-        print(folder)
-")
-FOLDER1=$(echo "$COWORK_FOLDERS" | sed -n '1p')
-FOLDER2=$(echo "$COWORK_FOLDERS" | sed -n '2p')
-FOLDER3=$(echo "$COWORK_FOLDERS" | sed -n '3p')
-assert_eq "Subpath rewritten" "$HOME/DocsLocal/SubPath/deep/nested/dir" "$FOLDER1"
-assert_eq "Exact path rewritten" "$HOME/DocsLocal/SubPath" "$FOLDER2"
-assert_eq "Unrelated path preserved" "/other/path" "$FOLDER3"
+COWORK_JSON="$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json"
+assert_eq "Subpath rewritten" "$HOME/DocsLocal/SubPath/deep/nested/dir" "$(read_json "$COWORK_JSON" userSelectedFolders.0)"
+assert_eq "Exact path rewritten" "$HOME/DocsLocal/SubPath" "$(read_json "$COWORK_JSON" userSelectedFolders.1)"
+assert_eq "Unrelated path preserved" "/other/path" "$(read_json "$COWORK_JSON" userSelectedFolders.2)"
 
 restore_home
 
-# ── Test 15: Unicode U+2019 curly quote in source path ───
+# ── Test 15: Three-path model — sessions use logical path, files at physical path ──
 echo ""
-echo "Test 15: Project under path with Unicode curly quote (U+2019)"
+echo "Test 15: Migration Assistant three-path model (physical != session path)"
 setup_sandbox "t15"
-# Simulate the macOS Migration Assistant directory name with U+2019 curly apostrophe
+# Physical: project lives under "Documents - MacName/"
+MA_DIR="$HOME/Documents/Documents - TestMac"
+mkdir -p "$MA_DIR"
+PROJECT_SRC=$(create_project "$MA_DIR/Projects" "ThreePath")
+# Logical: sessions recorded the Finder merged path (no MA segment)
+LOGICAL_PATH="$HOME/Documents/Projects/ThreePath"
+# Sessions point to the LOGICAL path, not the physical one
+create_desktop_session "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1" "$LOGICAL_PATH"
+create_codex_session "$HOME/.codex/sessions/sess1" "$LOGICAL_PATH"
+create_cowork_session "$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1" "$LOGICAL_PATH"
+# CLI history with subagents and memory (mirrors real Desktop→CLI structure)
+CLI_DIR="$HOME/.claude/projects/$(encode_path "$LOGICAL_PATH")"
+mkdir -p "$CLI_DIR/sess-abc/subagents"
+echo "parent session" > "$CLI_DIR/sess-abc/session.jsonl"
+echo "subagent work" > "$CLI_DIR/sess-abc/subagents/agent-a1234.jsonl"
+echo "more subagent" > "$CLI_DIR/sess-abc/subagents/agent-a5678.jsonl"
+mkdir -p "$CLI_DIR/memory"
+echo "# Memory" > "$CLI_DIR/memory/MEMORY.md"
+
+OUTPUT=$(bash "$MIGRATE" --force ThreePath 2>&1)
+EXIT_CODE=$?
+assert_exit_code "Exits 0" "0" "$EXIT_CODE"
+assert_file_exists "Files copied from physical path" "$HOME/DocsLocal/ThreePath/README.md"
+assert_contains "Shows session path" "Session path" "$OUTPUT"
+assert_contains "Reports subagents" "subagent" "$OUTPUT"
+assert_contains "Reports memory" "memory: yes" "$OUTPUT"
+
+# All four tools updated from logical path → dest
+DESKTOP_JSON="$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json"
+assert_eq "Desktop cwd updated from logical path" "$HOME/DocsLocal/ThreePath" "$(read_json "$DESKTOP_JSON" cwd)"
+assert_eq "Codex cwd updated from logical path" "$HOME/DocsLocal/ThreePath" \
+    "$(read_codex_cwd "$HOME/.codex/sessions/sess1/session.jsonl")"
+assert_eq "Co-work folder updated from logical path" "$HOME/DocsLocal/ThreePath" \
+    "$(read_json "$HOME/Library/Application Support/Claude/local-agent-mode-sessions/inst1/user1/local_cowork456.json" userSelectedFolders.0)"
+
+# CLI history copied with subagents and memory preserved
+DEST_CLI="$HOME/.claude/projects/$(encode_path "$HOME/DocsLocal/ThreePath")"
+assert_file_exists "CLI parent session copied" "$DEST_CLI/sess-abc/session.jsonl"
+assert_file_exists "CLI subagent copied" "$DEST_CLI/sess-abc/subagents/agent-a1234.jsonl"
+assert_file_exists "CLI memory copied" "$DEST_CLI/memory/MEMORY.md"
+
+restore_home
+
+# ── Test 16: Unicode U+2019 with three-path model ───────
+echo ""
+echo "Test 16: Unicode curly quote (U+2019) with session path stripping"
+setup_sandbox "t16"
 UNICODE_DIR="$HOME/Documents/Documents - TMD"$'\xe2\x80\x99'"s MacBook Pro"
 mkdir -p "$UNICODE_DIR"
 PROJECT_SRC=$(create_project "$UNICODE_DIR" "UnicodeProj")
-create_desktop_session "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1" "$PROJECT_SRC"
-create_codex_session "$HOME/.codex/sessions/sess1" "$PROJECT_SRC"
+# Session uses the logical path (no MA segment)
+LOGICAL_PATH="$HOME/Documents/UnicodeProj"
+create_desktop_session "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1" "$LOGICAL_PATH"
 
 OUTPUT=$(bash "$MIGRATE" --force UnicodeProj 2>&1)
 EXIT_CODE=$?
-assert_exit_code "Exits 0 with Unicode path" "0" "$EXIT_CODE"
-assert_file_exists "Project copied from Unicode path" "$HOME/DocsLocal/UnicodeProj/README.md"
-
-# Verify Desktop session updated
-UNICODE_CWD=$(python3 -c "
-import json
-with open('$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json') as f:
-    print(json.load(f)['cwd'])
-")
-assert_eq "Desktop cwd updated from Unicode source" "$HOME/DocsLocal/UnicodeProj" "$UNICODE_CWD"
-
-# Verify Codex session updated
-UNICODE_CODEX=$(python3 -c "
-import json
-with open('$HOME/.codex/sessions/sess1/session.jsonl') as f:
-    for line in f:
-        d = json.loads(line.strip())
-        if d.get('type') == 'session_meta':
-            print(d['payload']['cwd'])
-            break
-")
-assert_eq "Codex cwd updated from Unicode source" "$HOME/DocsLocal/UnicodeProj" "$UNICODE_CODEX"
+assert_exit_code "Exits 0 with Unicode + three-path" "0" "$EXIT_CODE"
+assert_file_exists "Project copied" "$HOME/DocsLocal/UnicodeProj/README.md"
+assert_eq "Desktop cwd updated through Unicode source" "$HOME/DocsLocal/UnicodeProj" \
+    "$(read_json "$HOME/Library/Application Support/Claude/claude-code-sessions/acct1/sess1/local_test123.json" cwd)"
 
 restore_home
 

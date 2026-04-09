@@ -6,6 +6,8 @@ Migrate projects out of iCloud-managed `~/Documents` into a local directory, pre
 
 macOS Migration Assistant creates nested directories under `~/Documents` (e.g. `Documents - <OldMacName>/`). With iCloud Drive syncing `~/Documents`, node_modules, Docker data, and git repos are synced unnecessarily. Worse, AI coding tools store absolute paths in session metadata — when files move, sessions break with "Folder no longer exists."
 
+The complication: macOS Finder presents a *merged view* of `~/Documents/`, so tools that open a project see a logical path like `~/Documents/Projects/TSC` while the files physically live at `~/Documents/Documents - TMD's MacBook Pro/Projects/TSC`. The script handles this automatically — it copies from the physical location but matches and rewrites sessions using the logical path that tools recorded.
+
 ## Quick Start
 
 ```bash
@@ -27,13 +29,15 @@ bash migrate-project.sh --dry-run Projects
 
 ## What It Does
 
-1. **Finds** the project under `~/Documents` (handles Unicode directory names automatically)
-2. **Copies** to `~/DocsLocal/<project-name>` using rsync (resumable if interrupted)
-3. **Verifies** the copy by comparing file counts
-4. **Updates** Claude Code Desktop session metadata (`cwd` and `originCwd` in session JSON)
-5. **Updates** Claude Co-work session metadata (`userSelectedFolders` mount paths)
-6. **Updates** Codex session_meta `cwd` in JSONL (conversation content untouched)
-7. **Copies** Claude Code CLI project history to the new encoded path
+1. **Finds** the project under `~/Documents` (handles Unicode directory names and Migration Assistant paths automatically)
+2. **Detects** the logical session path that AI tools recorded (strips the Migration Assistant directory segment)
+3. **Reports** an inventory of affected sessions — titles, subagent counts, memory files — before making changes
+4. **Copies** to `~/DocsLocal/<project-name>` using rsync (resumable if interrupted)
+5. **Verifies** the copy by comparing file counts
+6. **Updates** Claude Code Desktop session metadata (`cwd` and `originCwd` in session JSON)
+7. **Updates** Claude Co-work session metadata (`userSelectedFolders` mount paths)
+8. **Updates** Codex session_meta `cwd` in JSONL (conversation content untouched)
+9. **Copies** Claude Code CLI project history to the new encoded path (including subagent JSONLs and memory)
 
 Nothing is deleted. Originals are preserved. Session JSON files are backed up to `.bak` before modification.
 
@@ -63,7 +67,7 @@ The test suite creates isolated sandboxes, simulates all four AI tool session st
 bash test-migrate.sh
 ```
 
-15 test scenarios, 51 assertions. Covers spaces in names, Unicode paths, malformed JSON, resumable copies, ambiguous matches, path traversal, subpath replacement, and more. No side effects on the real system.
+16 test scenarios, 61 assertions. Covers spaces in names, Unicode paths, malformed JSON, resumable copies, ambiguous matches, path traversal, subpath replacement, and more. No side effects on the real system.
 
 ## Files
 
