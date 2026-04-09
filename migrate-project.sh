@@ -30,7 +30,7 @@
 #   bash migrate-project.sh "Obsidian Vault"
 #   bash migrate-project.sh --dry-run Projects
 # ═══════════════════════════════════════════════════════════════════════
-set -e
+set -euo pipefail
 
 # ── Parse arguments ───────────────────────────────────────
 DRY_RUN=false
@@ -41,6 +41,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
         --force)   FORCE=true ;;
+        --*)       echo "  ABORT: Unknown option: $arg"; exit 1 ;;
         *)         PROJECT_NAME="$arg" ;;
     esac
 done
@@ -68,6 +69,17 @@ log() { echo "$1" | tee -a "$OUT"; }
 die() { log "  ABORT: $1"; exit 1; }
 warn() { log "  ⚠ $1"; }
 
+# Track in-progress backup so we can restore on interruption
+CURRENT_BACKUP=""
+cleanup_on_signal() {
+    if [ -n "$CURRENT_BACKUP" ] && [ -f "$CURRENT_BACKUP" ]; then
+        cp "$CURRENT_BACKUP" "${CURRENT_BACKUP%.bak}"
+        log "  Restored from backup after interruption: ${CURRENT_BACKUP%.bak}"
+    fi
+    exit 1
+}
+trap cleanup_on_signal INT TERM
+
 mkdir -p "$(dirname "$OUT")"
 echo "" > "$OUT"
 log "═══ Project Migration: $PROJECT_NAME ═══"
@@ -81,10 +93,19 @@ log ""
 log "[1/8] Pre-flight checks"
 
 # Claude Desktop must not be running (current user only)
-if pgrep -x -u "$USER" "Claude" > /dev/null 2>&1; then
-    die "Claude Desktop is running. Quit it first (Cmd+Q)."
+# SKIP_PROCESS_CHECK=1 allows test suites to bypass this while Claude is open
+if [ "${SKIP_PROCESS_CHECK:-}" != "1" ]; then
+    if pgrep -x -u "$USER" "Claude" > /dev/null 2>&1; then
+        die "Claude Desktop is running. Quit it first (Cmd+Q)."
+    fi
+    if pgrep -x -u "$USER" "codex" > /dev/null 2>&1; then
+        warn "Codex appears to be running. Session updates may conflict."
+    fi
+    if pgrep -u "$USER" -f "claude.*--project" > /dev/null 2>&1; then
+        warn "Claude Code CLI appears to be running. Session updates may conflict."
+    fi
 fi
-log "  ✓ Claude Desktop not running"
+log "  ✓ Process checks passed"
 
 # Find the project — search all of ~/Documents, handle Unicode names
 SRC_CANDIDATES=$(find "$HOME/Documents" -maxdepth 5 -type d -name "$PROJECT_NAME" 2>/dev/null)
@@ -103,10 +124,10 @@ log "  ✓ Source: $SRC"
 DEST="$DEST_BASE/$PROJECT_NAME"
 
 # Validate destination stays within DEST_BASE (prevent path traversal)
-DEST_REAL=$(mkdir -p "$DEST" && cd "$DEST" && pwd)
-DEST_BASE_REAL=$(cd "$DEST_BASE" && pwd)
+# Resolve both canonical paths without creating DEST (handles /tmp → /private/tmp etc.)
+DEST_REAL=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$DEST")
+DEST_BASE_REAL=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$DEST_BASE")
 if [[ "$DEST_REAL" != "$DEST_BASE_REAL"/* ]]; then
-    rmdir "$DEST" 2>/dev/null  # clean up if we just created it
     die "Destination '$DEST' resolves outside of $DEST_BASE (path traversal). Aborting."
 fi
 
@@ -156,12 +177,13 @@ else
     log "  Claude Code Desktop: no sessions reference this project"
 fi
 
-# Claude Code CLI history
+# Claude Code CLI history — match by exact encoded path, not wildcard
 CLI_MATCHES=()
 if [ -d "$CLI_PROJECTS" ]; then
-    while IFS= read -r d; do
-        CLI_MATCHES+=("$d")
-    done < <(find "$CLI_PROJECTS" -maxdepth 1 -type d -name "*${PROJECT_NAME}*" 2>/dev/null || true)
+    OLD_CLI_ENCODED=$(encode_path "$SRC")
+    if [ -d "$CLI_PROJECTS/$OLD_CLI_ENCODED" ]; then
+        CLI_MATCHES=("$CLI_PROJECTS/$OLD_CLI_ENCODED")
+    fi
 fi
 if [ ${#CLI_MATCHES[@]} -gt 0 ]; then
     HAS_CLI=true
@@ -241,6 +263,7 @@ if [ "$FORCE" = false ]; then
 fi
 
 # ── 4. Copy ──────────────────────────────────────────────
+mkdir -p "$DEST"
 SRC_COUNT=$(find "$SRC" -type f | wc -l | tr -d ' ')
 SRC_SIZE=$(du -sh "$SRC" | cut -f1)
 log "[3/8] Copying $PROJECT_NAME ($SRC_SIZE, $SRC_COUNT files)"
@@ -280,20 +303,39 @@ print(d.get('cwd', ''))
             continue
         fi
 
+        # Verify cwd actually points to our source project (not a different project
+        # that happens to share the same name as a final path component)
+        if [ "$OLD_CWD" != "$SRC" ] && [[ "$OLD_CWD" != "$SRC/"* ]]; then
+            log "  - Skipping (cwd $OLD_CWD is not under $SRC): $sf"
+            continue
+        fi
+
         log "  $OLD_CWD → $DEST"
 
         # Backup
         cp "$sf" "${sf}.bak"
+        CURRENT_BACKUP="${sf}.bak"
 
-        # Update cwd and originCwd
-        PYTHON_OUTPUT=$(python3 - "$sf" "$DEST" << 'PYEOF'
+        # Update cwd and originCwd, preserving subpath if present
+        PYTHON_OUTPUT=$(python3 - "$sf" "$SRC" "$DEST" << 'PYEOF'
 import json, sys
 
 session_file = sys.argv[1]
-new_path = sys.argv[2]
+old_base = sys.argv[2]
+new_base = sys.argv[3]
 
 with open(session_file) as f:
     data = json.load(f)
+
+old_cwd = data.get('cwd', '')
+# Rewrite path: replace old_base prefix with new_base
+if old_cwd == old_base:
+    new_path = new_base
+elif old_cwd.startswith(old_base + '/'):
+    new_path = new_base + old_cwd[len(old_base):]
+else:
+    print(f'    - Skipping (cwd {old_cwd} not under {old_base})')
+    sys.exit(0)
 
 data['cwd'] = new_path
 data['originCwd'] = new_path
@@ -312,8 +354,10 @@ PYEOF
         ) || {
             log "    ERROR: Update failed — restoring backup"
             cp "${sf}.bak" "$sf"
+            CURRENT_BACKUP=""
             continue
         }
+        CURRENT_BACKUP=""
         log "$PYTHON_OUTPUT"
     done
 fi
@@ -357,6 +401,7 @@ print(d.get('title', 'untitled'))
 
         # Backup
         cp "$cf" "${cf}.bak"
+        CURRENT_BACKUP="${cf}.bak"
 
         # Update userSelectedFolders: replace entries containing old SRC path with DEST
         PYTHON_OUTPUT=$(python3 - "$cf" "$SRC" "$DEST" << 'PYEOF'
@@ -401,8 +446,10 @@ PYEOF
         ) || {
             log "    ERROR: Update failed — restoring backup"
             cp "${cf}.bak" "$cf"
+            CURRENT_BACKUP=""
             continue
         }
+        CURRENT_BACKUP=""
         log "$PYTHON_OUTPUT"
     done
 fi
@@ -419,15 +466,17 @@ else
 
         # Backup
         cp "$cf" "${cf}.bak"
+        CURRENT_BACKUP="${cf}.bak"
 
         # Rewrite only the session_meta line, preserve all other lines exactly
-        PYTHON_OUTPUT=$(python3 - "$cf" "$DEST" << 'PYEOF'
+        PYTHON_OUTPUT=$(python3 - "$cf" "$SRC" "$DEST" << 'PYEOF'
 import json, sys
 
 jsonl_path = sys.argv[1]
-new_cwd = sys.argv[2]
+old_base = sys.argv[2]
+new_base = sys.argv[3]
 
-with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+with open(jsonl_path, "r", encoding="utf-8", errors="surrogateescape") as f:
     lines = f.readlines()
 
 updated = False
@@ -448,11 +497,17 @@ for line in lines:
     if data.get("type") == "session_meta":
         old_cwd = data.get("payload", {}).get("cwd", "")
         if "payload" in data and "cwd" in data["payload"]:
-            data["payload"]["cwd"] = new_cwd
-            new_lines.append(json.dumps(data) + "\n")
-            updated = True
-            print(f'    {old_cwd}')
-            print(f'    -> {new_cwd}')
+            # Only update if cwd matches the source project path
+            if old_cwd == old_base or old_cwd.startswith(old_base + '/'):
+                new_cwd = new_base + old_cwd[len(old_base):]
+                data["payload"]["cwd"] = new_cwd
+                new_lines.append(json.dumps(data) + "\n")
+                updated = True
+                print(f'    {old_cwd}')
+                print(f'    -> {new_cwd}')
+            else:
+                print(f'    - Skipping (cwd {old_cwd} is not under {old_base})')
+                new_lines.append(line)
         else:
             new_lines.append(line)
     else:
@@ -462,7 +517,7 @@ if invalid_count > 0:
     print(f'    ⚠ {invalid_count} invalid JSONL line(s) found (preserved as-is)')
 
 if updated:
-    with open(jsonl_path, "w", encoding="utf-8") as f:
+    with open(jsonl_path, "w", encoding="utf-8", errors="surrogateescape") as f:
         f.writelines(new_lines)
 
     # Verify: re-read and check
@@ -476,8 +531,9 @@ if updated:
             except json.JSONDecodeError:
                 continue
             if vdata.get("type") == "session_meta":
-                assert vdata["payload"]["cwd"] == new_cwd, \
-                    f"Codex verify failed: {vdata['payload']['cwd']}"
+                vcwd = vdata["payload"]["cwd"]
+                assert vcwd == new_base or vcwd.startswith(new_base + '/'), \
+                    f"Codex verify failed: {vcwd} not under {new_base}"
                 print('    ✓ Verified')
                 break
 else:
@@ -486,8 +542,10 @@ PYEOF
         ) || {
             log "    ERROR: Update failed — restoring backup"
             cp "${cf}.bak" "$cf"
+            CURRENT_BACKUP=""
             continue
         }
+        CURRENT_BACKUP=""
         log "$PYTHON_OUTPUT"
     done
 fi
